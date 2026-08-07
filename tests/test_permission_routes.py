@@ -132,13 +132,13 @@ def ctx(tmp_path):
     app.dependency_overrides[get_session] = _session_override
     app.dependency_overrides[get_current_user] = _user_override
 
-    client = TestClient(app)
+    with TestClient(app) as client:
+        def as_user(username):
+            current["username"] = username
+            return client
 
-    def as_user(username):
-        current["username"] = username
-        return client
-
-    yield as_user, ids
+        yield as_user, ids
+    
     engine.dispose()
 
 

@@ -211,29 +211,29 @@ def test_resolve_records_resolution_and_is_idempotent(ctx):
     from app.schemas.permissions import DatasetRole
 
     _grant(ctx, "ann", DatasetRole.ANNOTATOR.value)
-    client = _reviews_client(ctx, "ann")
     rejection_id = ctx["rejections"]["outline"]
+    with _reviews_client(ctx, "ann") as client:
+        body = client.patch(f"/reviews/rejections/{rejection_id}/resolve",
+                            json={"resolution": "wont_fix"}).json()
+        assert body["success"] is True
+        assert body["rejection"]["resolution"] == "wont_fix"
+        assert body["rejection"]["resolved_at"] is not None
 
-    body = client.patch(f"/reviews/rejections/{rejection_id}/resolve",
-                        json={"resolution": "wont_fix"}).json()
-    assert body["success"] is True
-    assert body["rejection"]["resolution"] == "wont_fix"
-    assert body["rejection"]["resolved_at"] is not None
+        row = ctx["db"].query(AnnotationRejections).filter_by(id=rejection_id).one()
+        assert row.resolution == "wont_fix"
 
-    row = ctx["db"].query(AnnotationRejections).filter_by(id=rejection_id).one()
-    assert row.resolution == "wont_fix"
-
-    # A resolve without a body must not clobber the recorded verdict.
-    again = client.patch(f"/reviews/rejections/{rejection_id}/resolve").json()
-    assert again["rejection"]["resolution"] == "wont_fix"
+        # A resolve without a body must not clobber the recorded verdict.
+        again = client.patch(f"/reviews/rejections/{rejection_id}/resolve").json()
+        assert again["rejection"]["resolution"] == "wont_fix"
 
 
 def test_correction_summary_endpoint(ctx):
     from app.schemas.permissions import DatasetRole
 
     _grant(ctx, "ann", DatasetRole.ANNOTATOR.value)
-    body = _reviews_client(ctx, "ann").get(
-        f"/reviews/datasets/{ctx['dataset_id']}/correction-summary").json()
+    with _reviews_client(ctx, "ann") as client:
+        body = client.get(
+            f"/reviews/datasets/{ctx['dataset_id']}/correction-summary").json()
     assert body["success"] is True
     assert body["summary"]["open_rejections"] == 3
 

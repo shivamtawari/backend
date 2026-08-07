@@ -279,7 +279,8 @@ def test_bulk_approve_respects_separation_of_duties(ctx):
     db.commit()
 
     mask_id = db.query(Contours.mask_id).filter_by(id=ctx["contours"]["a"]).scalar()
-    response = _review_client(ctx, "rev").post(f"/reviews/masks/{mask_id}/approve")
+    with _review_client(ctx, "rev") as client:
+        response = client.post(f"/reviews/masks/{mask_id}/approve")
     assert response.status_code == 200
     body = response.json()
     assert set(body["approved"]) == {ctx["contours"]["a"], ctx["contours"]["c"]}
@@ -297,15 +298,15 @@ def test_bulk_approve_can_stack_a_second_opinion(ctx):
     db.commit()
 
     mask_id = db.query(Contours.mask_id).filter_by(id=ctx["contours"]["a"]).scalar()
-    client = _review_client(ctx, "rev2")
+    with _review_client(ctx, "rev2") as client:
 
-    # Without the flag, root_d (already approved by rev) stays untouched.
-    body = client.post(f"/reviews/masks/{mask_id}/approve").json()
-    assert ctx["contours"]["d"] not in body["approved"]
+        # Without the flag, root_d (already approved by rev) stays untouched.
+        body = client.post(f"/reviews/masks/{mask_id}/approve").json()
+        assert ctx["contours"]["d"] not in body["approved"]
 
-    # With it, rev2's approval lands on top of rev's.
-    body = client.post(f"/reviews/masks/{mask_id}/approve?include_reviewed=true").json()
-    assert ctx["contours"]["d"] in body["approved"]
+        # With it, rev2's approval lands on top of rev's.
+        body = client.post(f"/reviews/masks/{mask_id}/approve?include_reviewed=true").json()
+        assert ctx["contours"]["d"] in body["approved"]
     reviewers = {user.username for user in
                  db.query(Contours).filter_by(id=ctx["contours"]["d"]).one().reviewed_by}
     assert reviewers == {"rev", "rev2"}

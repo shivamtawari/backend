@@ -5,6 +5,7 @@ from logging import getLogger
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
 from iquana_toolbox.schemas.training import InstanceSegmentationTrainingRequest
 from iquana_toolbox.schemas.user import User
@@ -21,7 +22,7 @@ from app.services.ai_services.instance_segmentation import InstanceSegmentationS
 from app.services.auth import get_current_user
 from app.services.database_access import datasets as datasets_db
 from app.services.database_access import labels as labels_db
-from app.services.database_access.datasets import export_dataset_contours_to_coco
+from app.services.instance_segmentation_training import export_training_hierarchy_dataset
 from app.services.model_registry import MODEL_REGISTRY, list_available_models
 from app.services.permissions import ensure_permission, require
 
@@ -160,15 +161,38 @@ async def start_training(
         raise HTTPException(status_code=http_status.HTTP_400_BAD_REQUEST,
                             detail="The dataset has no labels to train on.")
 
-    # Write the COCO annotation file to disk so the worker can read it from the
-    # shared data volume. contour_selection="all" emits every hierarchy level so the
-    # model sees training examples for every class (parents overlap their children).
-    export = await export_dataset_contours_to_coco(
-        body.dataset_id, db, contour_selection="all", write_to_disk=True
+    # Use the exclusive hierarchy encoder to produce mutually exclusive RLE masks
+    # for all requested labels. The worker reads this sidecar-enriched payload
+    # from the shared volume.
+    # Release the read lock held by this route's session so the background
+    # thread's session doesn't deadlock against it (critical for SQLite tests).
+    db.commit()
+
+    def _export_job(engine, dataset_id, label_ids):
+        from sqlalchemy.orm import Session
+        with Session(engine) as thread_db:
+            return export_training_hierarchy_dataset(
+                dataset_id=dataset_id,
+                db=thread_db,
+                selected_label_ids=label_ids,
+                write_to_disk=True,
+            )
+
+    export = await run_in_threadpool(
+        _export_job,
+        engine=db.get_bind(),
+        dataset_id=body.dataset_id,
+        label_ids=[l.id for l in labels],
     )
     if not export.get("success"):
-        raise HTTPException(status_code=http_status.HTTP_400_BAD_REQUEST,
-                            detail=export.get("message", "Failed to export annotations."))
+        raise HTTPException(
+            status_code=http_status.HTTP_400_BAD_REQUEST,
+            detail={
+                "message": export.get("message", "Failed to export annotations."),
+                "error_code": export.get("error_code", "export_failed"),
+                "details": export.get("details", {}),
+            }
+        )
     if export.get("num_annotations", 0) == 0:
         raise HTTPException(status_code=http_status.HTTP_400_BAD_REQUEST,
                             detail="Dataset has no reviewed annotations to train on.")
