@@ -533,6 +533,23 @@ async def handle_instance_segmentation(websocket: WebSocket, client_msg: ClientM
         return
 
     model_registry_key = client_msg.data.get("model_registry_key")
+    apply_mode = client_msg.data.get("apply_mode", "patch")
+
+    from app.services.model_registry import _full_model_info
+    from iquana_toolbox.schemas.model_info import parse_tags_to_model_info
+
+    try:
+        model_info = parse_tags_to_model_info(_full_model_info(model_registry_key))
+    except Exception as e:
+        await send_msg(websocket, ServerMessage(
+            id=client_msg.id,
+            type=ServerMessageType.ERROR,
+            success=False,
+            message=f"Failed to fetch model info for {model_registry_key}: {e}",
+            data=None
+        ))
+        return
+
     result = await run_instance_segmentation(
         service=state._running_backends[Backends.INSTANCE_SEGMENTATION.value],
         image_url=state.image_db.file_path,
@@ -542,24 +559,57 @@ async def handle_instance_segmentation(websocket: WebSocket, client_msg: ClientM
         user_id=state.user_id,
     )
 
-    # Replace the existing contours with the freshly detected instances.
-    with get_context_session() as db:
-        await masks_db.delete_all_contours_of_mask(state.mask_id, db=db)
-        for contour in result.contours:
-            await masks_db.add_contour_to_mask(state.mask_id, contour, db=db)
-        hierarchy = await masks_db.get_contour_hierarchy_of_mask(state.mask_id, db)
+    if not result.success:
+        await send_msg(websocket, ServerMessage(
+            id=client_msg.id,
+            type=ServerMessageType.ERROR,
+            success=False,
+            message=result.message or "Instance segmentation inference failed.",
+            data=None
+        ))
+        return
+
+    from app.services.instance_prediction_application import apply_instance_segmentation_predictions
+
+    try:
+        with get_context_session() as db:
+            stats = await apply_instance_segmentation_predictions(
+                db=db,
+                mask_id=state.mask_id,
+                dataset_id=state.dataset_id,
+                author_username=state.user_id,
+                predictions=result.contours,
+                apply_mode=apply_mode,
+                model_info=model_info,
+            )
+            hierarchy = await masks_db.get_contour_hierarchy_of_mask(state.mask_id, db)
+            db.commit()
+    except Exception as e:
+        logger.exception("Failed to apply predictions")
+        await send_msg(websocket, ServerMessage(
+            id=client_msg.id,
+            type=ServerMessageType.ERROR,
+            success=False,
+            message=f"Failed to apply predictions: {e}",
+            data=None
+        ))
+        return
+
     state.contour_hierarchy = hierarchy
 
     # Send the full hierarchy so the client refreshes its object list in one go.
     # Use OBJECTS (not OBJECT_ADDED): the client resolves label names against the
     # dataset's label map on the OBJECTS path, so the detected instances keep their
     # labels. The matching message id also resolves the caller's pending request.
+    payload = hierarchy.model_dump()
+    payload["applied_stats"] = stats
+
     await send_msg(websocket, ServerMessage(
         id=client_msg.id,
         type=ServerMessageType.OBJECTS,
-        success=result.success,
-        message=result.message or f"Instance segmentation detected {len(result.contours)} objects.",
-        data=hierarchy.model_dump(),
+        success=True,
+        message=f"Instance segmentation applied successfully (Mode: {apply_mode}).",
+        data=payload,
     ))
 
 

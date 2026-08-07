@@ -55,6 +55,18 @@ def ctx(tmp_path):
     image 1, a mask-level one on image 2, a second contour-level one on image 1)
     plus one already-resolved rejection that must never appear."""
     engine = create_engine(f"sqlite:///{tmp_path / 'correction.db'}")
+    
+    from sqlalchemy import event
+    wal_attempted = {"done": False}
+    @event.listens_for(engine, "connect")
+    def set_sqlite_pragma(dbapi_connection, connection_record):
+        cursor = dbapi_connection.cursor()
+        if not wal_attempted["done"]:
+            wal_attempted["done"] = True
+            cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA synchronous=NORMAL")
+        cursor.close()
+        
     database.metadata.create_all(engine)
     db = sessionmaker(bind=engine)()
 
@@ -251,6 +263,18 @@ def test_replace_contour_preserves_open_rejection(tmp_path):
     from app.services.database_access.contours import replace_contour
 
     engine = create_engine(f"sqlite:///{tmp_path / 'replace.db'}")
+    
+    from sqlalchemy import event
+    wal_attempted = {"done": False}
+    @event.listens_for(engine, "connect")
+    def set_sqlite_pragma(dbapi_connection, connection_record):
+        cursor = dbapi_connection.cursor()
+        if not wal_attempted["done"]:
+            wal_attempted["done"] = True
+            cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA synchronous=NORMAL")
+        cursor.close()
+        
     database.metadata.create_all(engine)
     db = sessionmaker(bind=engine)()
 

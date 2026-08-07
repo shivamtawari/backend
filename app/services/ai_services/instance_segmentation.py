@@ -66,10 +66,18 @@ class InstanceSegmentationService(BaseService):
             response.raise_for_status()
             return response.json()
 
-    async def get_training_task_state(self, task_id: str) -> str:
-        """Read the authoritative Celery state for a training task."""
+    async def get_training_task_state(self, task_id: str) -> dict:
+        """Read the authoritative durable state for a training task."""
         async with httpx.AsyncClient(timeout=10) as client:
             url = f"{self.backend_url}/train/{task_id}"
             response = await client.get(url)
             response.raise_for_status()
-            return response.json().get("state", "PENDING")
+            return response.json()
+
+    async def list_training_jobs(self, dataset_id: int, limit: int = 20, offset: int = 0) -> list[dict]:
+        """List durable training jobs for a dataset."""
+        async with httpx.AsyncClient(timeout=10) as client:
+            url = f"{self.backend_url}/train/dataset/{dataset_id}"
+            response = await client.get(url, params={"limit": limit, "offset": offset})
+            response.raise_for_status()
+            return response.json()

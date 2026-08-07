@@ -47,6 +47,18 @@ def ctx(tmp_path):
     """A dataset with one reviewable mask (a 3-deep hierarchy plus one already
     approved root), one unsubmitted mask and one rejected mask."""
     engine = create_engine(f"sqlite:///{tmp_path / 'queue.db'}")
+    
+    from sqlalchemy import event
+    wal_attempted = {"done": False}
+    @event.listens_for(engine, "connect")
+    def set_sqlite_pragma(dbapi_connection, connection_record):
+        cursor = dbapi_connection.cursor()
+        if not wal_attempted["done"]:
+            wal_attempted["done"] = True
+            cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA synchronous=NORMAL")
+        cursor.close()
+        
     database.metadata.create_all(engine)
     Session = sessionmaker(bind=engine)
     db = Session()
