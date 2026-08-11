@@ -27,10 +27,20 @@ async def apply_instance_segmentation_predictions(
     if apply_mode not in ("patch", "replace"):
         raise ValueError(f"Invalid apply_mode: {apply_mode}")
 
+    if model_info.dataset_id is not None and model_info.dataset_id != dataset_id:
+        raise ValueError(f"Model dataset {model_info.dataset_id} does not match target dataset {dataset_id}")
+
     model_labels = set(model_info.label_ids)
+
+    def validate_node_recursively(node: Contour):
+        if node.label_id not in model_labels:
+            raise ValueError(f"Prediction label {node.label_id} is outside model's declared scope {model_labels}")
+        for child in node.children:
+            validate_node_recursively(child)
+
     for p in predictions:
-        if p.label_id not in model_labels:
-            raise ValueError(f"Prediction label {p.label_id} is outside model's declared scope {model_labels}")
+        validate_node_recursively(p)
+
     
     # 1. Fetch current hierarchies
     mask_hierarchy = await masks_db.get_contour_hierarchy_of_mask(mask_id, db)
@@ -76,19 +86,37 @@ async def apply_instance_segmentation_predictions(
     elif apply_mode == "patch":
         # Keep all existing contours. Suppress new same-label predictions above IoU threshold.
         # We check IoU against existing contours of the same label.
+        def duplicate_of(prediction: Contour) -> Contour | None:
+            for existing in mask_hierarchy.label_id_to_contours.get(prediction.label_id, []):
+                if _iou(prediction, existing) >= DUPLICATE_IOU_THRESHOLD:
+                    return existing
+            return None
+
+        def keep_novel_descendants(prediction: Contour, existing_parent: Contour) -> None:
+            """Keep children that add information when their predicted parent is a duplicate.
+
+            Patch mode must not drop a newly predicted polyp merely because its coral
+            parent overlaps an existing coral.  A duplicate descendant is suppressed
+            recursively; a novel descendant is attached to the matching existing
+            parent and saved with its own subtree.
+            """
+            nonlocal suppressed_count
+
+            for child in prediction.children:
+                matching_child = duplicate_of(child)
+                if matching_child is not None:
+                    suppressed_count += 1
+                    keep_novel_descendants(child, matching_child)
+                    continue
+
+                child.parent_id = existing_parent.id
+                to_insert.append(child)
+
         for pred in predictions:
-            pred_label = pred.label_id
-            existing_of_same_label = mask_hierarchy.label_id_to_contours.get(pred_label, [])
-            
-            # Use _iou from operations.py
-            is_duplicate = False
-            for existing in existing_of_same_label:
-                if _iou(pred, existing) >= DUPLICATE_IOU_THRESHOLD:
-                    is_duplicate = True
-                    break
-            
-            if is_duplicate:
+            matching_existing = duplicate_of(pred)
+            if matching_existing is not None:
                 suppressed_count += 1
+                keep_novel_descendants(pred, matching_existing)
             else:
                 to_insert.append(pred)
 

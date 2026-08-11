@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, TypeAlias
 
 import cv2
@@ -28,6 +28,9 @@ from pycocotools import mask as coco_mask
 
 
 EXCLUSIVE_HIERARCHY_V1 = "exclusive_hierarchy_v1"
+STRICT_HIERARCHY_POLICY = "strict"
+NORMALIZE_HIERARCHY_POLICY = "normalize"
+MIN_AUTO_PARENT_CONTAINMENT = 0.5
 
 
 class HierarchyValidationError(ValueError):
@@ -1878,6 +1881,276 @@ from app.database.masks import Masks
 from app.database.datasets import Datasets
 from app.services.database_access.datasets import _native_image_dimensions
 
+
+def _rasterize_training_contour(
+        contour: Contours,
+        width: int,
+        height: int,
+) -> tuple[np.ndarray, bool]:
+    """Rasterize a stored contour, clipping crop-boundary overshoot for export.
+
+    Imported geometric annotations such as circles may legitimately extend beyond a
+    cropped image. Those pixels do not exist and are clipped by image viewers anyway;
+    the strict pure encoder remains unchanged, while the explicit normalized training
+    path records that clipping was required.
+    """
+    x = np.asarray(contour.x, dtype=np.float64)
+    y = np.asarray(contour.y, dtype=np.float64)
+    if x.ndim != 1 or y.ndim != 1 or len(x) != len(y) or len(x) < 3:
+        raise HierarchyValidationError(
+            f"contour {contour.id} must have at least three paired x/y coordinates"
+        )
+    if not np.isfinite(x).all() or not np.isfinite(y).all():
+        raise HierarchyValidationError(f"contour {contour.id} has non-finite x/y coordinates")
+
+    normalized = bool(np.max(np.abs(x)) <= 1.5 and np.max(np.abs(y)) <= 1.5)
+    if normalized:
+        clipped = bool(np.any(x < 0) or np.any(x > 1) or np.any(y < 0) or np.any(y > 1))
+        points = np.column_stack((np.clip(x, 0, 1) * width, np.clip(y, 0, 1) * height))
+    else:
+        clipped = bool(
+            np.any(x < 0) or np.any(x > width) or np.any(y < 0) or np.any(y > height)
+        )
+        points = np.column_stack((np.clip(x, 0, width), np.clip(y, 0, height)))
+
+    polygon = np.rint(points).astype(np.int32)
+    raster = np.zeros((height, width), dtype=np.uint8)
+    cv2.fillPoly(raster, [polygon.reshape((-1, 1, 2))], 1)
+    return raster.astype(bool), clipped
+
+
+def _partition_peer_masks_by_centroid(
+        peers: Sequence[HierarchyNode],
+        masks_by_id: dict[int, np.ndarray],
+) -> None:
+    """Give every shared peer pixel to the nearest instance centroid.
+
+    Contour IDs provide a stable tie-break: peers are processed in ascending ID order
+    and an equal-distance claimant never replaces the existing owner. The operation is
+    export-only; callers pass copies of the stored contour masks.
+    """
+    if len(peers) < 2:
+        return
+
+    shape = masks_by_id[peers[0].id].shape
+    owner = np.full(shape, -1, dtype=np.int64)
+    best_distance = np.full(shape, np.inf, dtype=np.float64)
+
+    for node in sorted(peers, key=lambda item: item.id):
+        mask = masks_by_id[node.id]
+        ys, xs = np.nonzero(mask)
+        if len(xs) == 0:
+            continue
+        center_x = float(xs.mean())
+        center_y = float(ys.mean())
+        distances = (xs - center_x) ** 2 + (ys - center_y) ** 2
+        current_distances = best_distance[ys, xs]
+        current_owners = owner[ys, xs]
+        take = (current_owners < 0) | (distances < current_distances)
+        if np.any(take):
+            take_y = ys[take]
+            take_x = xs[take]
+            owner[take_y, take_x] = node.id
+            best_distance[take_y, take_x] = distances[take]
+
+    for node in peers:
+        masks_by_id[node.id] = owner == node.id
+
+
+def _prepare_training_image_nodes(
+        *,
+        raw_nodes: Sequence[Mapping[str, Any]],
+        width: int,
+        height: int,
+        image_id: int,
+        file_name: str,
+        selected_label_ids: Sequence[int],
+) -> tuple[list[HierarchyNode], dict[str, Any]]:
+    """Analyse one image and build deterministic export-only normalized masks."""
+    nodes = [
+        _normalize_node(raw_node, height, width, image_id, index)
+        for index, raw_node in enumerate(raw_nodes)
+    ]
+    _validate_unique_node_ids(nodes)
+    nodes_by_id = {node.id: node for node in nodes}
+    _validate_parent_references(nodes, nodes_by_id)
+    _validate_parent_cycles(nodes, nodes_by_id)
+
+    selected_ids = set(selected_label_ids)
+    selected_nodes = [node for node in nodes if node.label_id in selected_ids]
+    selected_node_ids = {node.id for node in selected_nodes}
+    boundary_clipped_contour_ids = sorted(
+        node.id for node, raw_node in zip(nodes, raw_nodes)
+        if bool(_value(raw_node, "boundary_clipped", default=False))
+        and node.id in selected_node_ids
+    )
+
+    adjustable_children: list[dict[str, Any]] = []
+    unsafe_children: list[dict[str, Any]] = []
+    for child in selected_nodes:
+        if child.parent_id is None:
+            continue
+        parent = nodes_by_id.get(child.parent_id)
+        if parent is None:
+            continue
+        child_area = int(child.mask.sum())
+        if child_area <= 0:
+            continue
+        inside_pixels = int(np.logical_and(child.mask, parent.mask).sum())
+        if inside_pixels == child_area:
+            continue
+        contained_fraction = inside_pixels / child_area
+        item = {
+            "child_contour_id": child.id,
+            "parent_contour_id": parent.id,
+            "contained_fraction": round(contained_fraction, 6),
+            "escaped_pixels": child_area - inside_pixels,
+        }
+        if contained_fraction >= MIN_AUTO_PARENT_CONTAINMENT:
+            adjustable_children.append(item)
+        else:
+            unsafe_children.append(item)
+
+    peer_groups: dict[int | None, list[HierarchyNode]] = defaultdict(list)
+    for node in selected_nodes:
+        exported_parent_id = node.parent_id if node.parent_id in selected_node_ids else None
+        peer_groups[exported_parent_id].append(node)
+
+    overlapping_pairs: list[dict[str, Any]] = []
+    for peers in peer_groups.values():
+        ordered_peers = sorted(peers, key=lambda item: item.id)
+        for index, left in enumerate(ordered_peers):
+            for right in ordered_peers[index + 1:]:
+                intersection = int(np.logical_and(left.mask, right.mask).sum())
+                if intersection:
+                    overlapping_pairs.append({
+                        "left_contour_id": left.id,
+                        "right_contour_id": right.id,
+                        "intersection_pixels": intersection,
+                    })
+
+    adjustable_children.sort(key=lambda item: int(item["child_contour_id"]))
+    unsafe_children.sort(key=lambda item: int(item["child_contour_id"]))
+    overlapping_pairs.sort(key=lambda item: (
+        int(item["left_contour_id"]), int(item["right_contour_id"])
+    ))
+
+    issue = {
+        "image_id": image_id,
+        "file_name": file_name,
+        "adjustable_child_count": len(adjustable_children) if not unsafe_children else 0,
+        "excluded_child_count": len(unsafe_children),
+        "sibling_overlap_pair_count": len(overlapping_pairs),
+        "adjustable_children": adjustable_children,
+        "unsafe_children": unsafe_children,
+        "sibling_overlaps": overlapping_pairs,
+        "boundary_clipped_contour_ids": boundary_clipped_contour_ids,
+        "empty_after_normalization": [],
+        "action": "exclude" if unsafe_children else "normalize",
+    }
+    issue["requires_normalization"] = bool(
+        adjustable_children or unsafe_children or overlapping_pairs
+        or boundary_clipped_contour_ids
+    )
+
+    if unsafe_children or not issue["requires_normalization"]:
+        return nodes, issue
+
+    masks_by_id = {node.id: node.mask.copy() for node in nodes}
+    for peers in peer_groups.values():
+        _partition_peer_masks_by_centroid(peers, masks_by_id)
+
+    empty_after_partition = sorted(
+        node.id for node in selected_nodes if not np.any(masks_by_id[node.id])
+    )
+    if empty_after_partition:
+        issue["empty_after_normalization"] = empty_after_partition
+        issue["action"] = "exclude"
+        return nodes, issue
+
+    depths: dict[int, int] = {}
+
+    def depth(node_id: int) -> int:
+        if node_id in depths:
+            return depths[node_id]
+        parent_id = nodes_by_id[node_id].parent_id
+        depths[node_id] = (
+            0 if parent_id is None or parent_id not in nodes_by_id
+            else depth(parent_id) + 1
+        )
+        return depths[node_id]
+
+    for node in nodes:
+        depth(node.id)
+
+    # Only selected nodes and their ancestor chain participate. An unselected child
+    # must never enlarge a selected parent merely because it exists in the database.
+    propagating_ids = set(selected_node_ids)
+    for node in selected_nodes:
+        parent_id = node.parent_id
+        while parent_id in nodes_by_id:
+            propagating_ids.add(parent_id)
+            parent_id = nodes_by_id[parent_id].parent_id
+
+    # Propagate normalized child masks into ancestors from leaves to roots. The
+    # 50% decision above intentionally uses the original stored masks; propagation
+    # only makes relationships already accepted by that rule exact for export.
+    for child in sorted(nodes, key=lambda item: (depths[item.id], item.id), reverse=True):
+        if child.id not in propagating_ids:
+            continue
+        if child.parent_id in nodes_by_id:
+            masks_by_id[child.parent_id] |= masks_by_id[child.id]
+
+    selected_children: dict[int, list[int]] = defaultdict(list)
+    for node in selected_nodes:
+        if node.parent_id in selected_node_ids:
+            selected_children[node.parent_id].append(node.id)
+
+    empty_residual_ids: list[int] = []
+    for node in selected_nodes:
+        descendant_ids = _descendants(node.id, selected_children)
+        residual = masks_by_id[node.id].copy()
+        for descendant_id in descendant_ids:
+            residual &= ~masks_by_id[descendant_id]
+        if int(residual.sum()) < 1:
+            empty_residual_ids.append(node.id)
+    if empty_residual_ids:
+        issue["empty_after_normalization"] = sorted(empty_residual_ids)
+        issue["action"] = "exclude"
+        return nodes, issue
+
+    normalized_nodes = [replace(node, mask=masks_by_id[node.id]) for node in nodes]
+    return normalized_nodes, issue
+
+
+def _normalization_summary(issues: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    affected = sorted(
+        (dict(issue) for issue in issues if issue.get("requires_normalization")),
+        key=lambda issue: int(issue["image_id"]),
+    )
+    retained = [issue for issue in affected if issue.get("action") == "normalize"]
+    excluded = [issue for issue in affected if issue.get("action") == "exclude"]
+    return {
+        "policy": NORMALIZE_HIERARCHY_POLICY,
+        "minimum_parent_containment": MIN_AUTO_PARENT_CONTAINMENT,
+        "affected_image_count": len(affected),
+        "adjusted_image_count": len(retained),
+        "adjusted_child_count": sum(int(issue["adjustable_child_count"]) for issue in retained),
+        "excluded_image_count": len(excluded),
+        "excluded_child_count": sum(int(issue["excluded_child_count"]) for issue in excluded),
+        "empty_after_normalization_count": sum(
+            len(issue.get("empty_after_normalization", [])) for issue in excluded
+        ),
+        "sibling_overlap_pair_count": sum(
+            int(issue["sibling_overlap_pair_count"]) for issue in retained
+        ),
+        "boundary_clipped_contour_count": sum(
+            len(issue.get("boundary_clipped_contour_ids", [])) for issue in retained
+        ),
+        "affected_images": affected,
+        "source_annotations_modified": False,
+    }
+
 def export_training_hierarchy_dataset(
         dataset_id: int,
         db: Session,
@@ -1885,6 +2158,7 @@ def export_training_hierarchy_dataset(
         min_residual_area: int = 1,
         write_to_disk: bool = False,
         output_file_path: str | None = None,
+        hierarchy_conflict_policy: str = STRICT_HIERARCHY_POLICY,
 ) -> dict[str, Any]:
     dataset = db.query(Datasets).filter_by(id=dataset_id).first()
     if not dataset:
@@ -1900,6 +2174,15 @@ def export_training_hierarchy_dataset(
     missing = set(selected_label_ids) - set(label_parent_ids.keys())
     if missing:
         return {"success": False, "message": f"Selected labels not in dataset: {sorted(missing)}"}
+    if hierarchy_conflict_policy not in {
+        STRICT_HIERARCHY_POLICY,
+        NORMALIZE_HIERARCHY_POLICY,
+    }:
+        return {
+            "success": False,
+            "message": f"Unknown hierarchy conflict policy: {hierarchy_conflict_policy}.",
+            "error_code": "invalid_hierarchy_conflict_policy",
+        }
 
     query = (
         db.query(Contours, Images)
@@ -1924,8 +2207,11 @@ def export_training_hierarchy_dataset(
     seen_category_ids = set()
     all_sidecar_annotations = []
     exported_image_ids = set()
-    
-    for image_id, contours in contours_by_image.items():
+    prepared_images: list[tuple[int, list[HierarchyNode], list[int], int, int]] = []
+    normalization_issues: list[dict[str, Any]] = []
+
+    for image_id in sorted(contours_by_image):
+        contours = sorted(contours_by_image[image_id], key=lambda contour: contour.id)
         image_present_labels = {c.label_id for c in contours}
         image_selected_labels = [lid for lid in selected_label_ids if lid in image_present_labels]
         if not image_selected_labels:
@@ -1933,18 +2219,74 @@ def export_training_hierarchy_dataset(
 
         native_width, native_height = _native_image_dimensions(image_by_id[image_id])
         
-        nodes = [
-            {
-                "id": c.id,
-                "label_id": c.label_id,
-                "parent_id": c.parent_id,
-                "x": c.x,
-                "y": c.y,
-                "label_name": labels_by_id[c.label_id].name
+        raw_nodes = []
+        try:
+            for contour in contours:
+                contour_mask, boundary_clipped = _rasterize_training_contour(
+                    contour, native_width, native_height
+                )
+                raw_nodes.append({
+                    "id": contour.id,
+                    "label_id": contour.label_id,
+                    "parent_id": contour.parent_id,
+                    "mask": contour_mask,
+                    "boundary_clipped": boundary_clipped,
+                    "label_name": labels_by_id[contour.label_id].name,
+                })
+        except HierarchyValidationError as exc:
+            return {
+                "success": False,
+                "message": exc.message,
+                "error_code": exc.code,
+                "details": exc.details | {"image_id": image_id},
             }
-            for c in contours
-        ]
-        
+
+        try:
+            prepared_nodes, issue = _prepare_training_image_nodes(
+                raw_nodes=raw_nodes,
+                width=native_width,
+                height=native_height,
+                image_id=image_id,
+                file_name=str(image_by_id[image_id].file_name),
+                selected_label_ids=image_selected_labels,
+            )
+        except HierarchyValidationError as exc:
+            return {
+                "success": False,
+                "message": exc.message,
+                "error_code": exc.code,
+                "details": exc.details,
+            }
+
+        normalization_issues.append(issue)
+        if hierarchy_conflict_policy == NORMALIZE_HIERARCHY_POLICY and issue["action"] == "exclude":
+            continue
+        prepared_images.append((
+            image_id,
+            prepared_nodes if hierarchy_conflict_policy == NORMALIZE_HIERARCHY_POLICY else [
+                _normalize_node(raw_node, native_height, native_width, image_id, index)
+                for index, raw_node in enumerate(raw_nodes)
+            ],
+            image_selected_labels,
+            native_width,
+            native_height,
+        ))
+
+    normalization_summary = _normalization_summary(normalization_issues)
+    if (
+        hierarchy_conflict_policy == STRICT_HIERARCHY_POLICY
+        and normalization_summary["affected_image_count"]
+    ):
+        return {
+            "success": False,
+            "message": (
+                "Some hierarchy annotations need export-only normalization before training."
+            ),
+            "error_code": "hierarchy_normalization_required",
+            "details": {"summary": normalization_summary},
+        }
+
+    for image_id, nodes, image_selected_labels, native_width, native_height in prepared_images:
         try:
             payload = encode_exclusive_hierarchy_v1(
                 contours=nodes,
@@ -1964,9 +2306,9 @@ def export_training_hierarchy_dataset(
                 "success": False,
                 "message": exc.message,
                 "error_code": exc.code,
-                "details": exc.details,
+                "details": exc.details | {"image_id": image_id},
             }
-            
+
         all_images.extend(payload["images"])
         all_annotations.extend(payload["annotations"])
         all_sidecar_annotations.extend(payload["hierarchy"]["annotations"])
@@ -1978,12 +2320,23 @@ def export_training_hierarchy_dataset(
                 
         exported_image_ids.add(image_id)
                 
+    annotated_category_ids = {ann["category_id"] for ann in all_annotations}
+    missing_labels = [lbl_id for lbl_id in selected_label_ids if lbl_id not in annotated_category_ids]
+    if missing_labels:
+        return {
+            "success": False,
+            "message": f"Labels {missing_labels} have zero reviewed annotations in dataset {dataset_id}.",
+            "error_code": "missing_label_annotations",
+            "details": {"missing_label_ids": missing_labels},
+        }
+
     if not exported_image_ids:
         return {
             "success": False,
             "message": "No eligible contours found.",
             "error_code": "empty_export",
         }
+
 
     all_images.sort(key=lambda img: img["id"])
     all_annotations.sort(key=lambda ann: ann["id"])
@@ -2006,7 +2359,7 @@ def export_training_hierarchy_dataset(
             "selected_label_ids": sorted(selected_label_ids),
             "label_parent_ids": sidecar_labels,
             "annotations": all_sidecar_annotations,
-        }
+        },
     }
     
     result = {
@@ -2018,19 +2371,26 @@ def export_training_hierarchy_dataset(
         "num_images": len(all_images),
         "num_annotations": len(all_annotations),
         "num_categories": len(all_categories),
+        "normalization_summary": normalization_summary,
     }
 
     if write_to_disk:
         import os
         import json
+        import uuid
         if output_file_path is None:
-            output_file_path = os.path.join(str(dataset.folder_path), f"{dataset.name.replace(' ', '_')}_exclusive_coco.json")
+            exports_dir = os.path.join(str(dataset.folder_path), "training_exports")
+            output_file_path = os.path.join(exports_dir, f"export_{dataset_id}_{uuid.uuid4()}.json")
         output_dir = os.path.dirname(output_file_path)
         if output_dir:
             try:
                 os.makedirs(output_dir, exist_ok=True)
-                with open(output_file_path, "w", encoding="utf-8") as fp:
+                tmp_file_path = f"{output_file_path}.tmp"
+                with open(tmp_file_path, "w", encoding="utf-8") as fp:
                     json.dump(coco_payload, fp, indent=2)
+                    fp.flush()
+                    os.fsync(fp.fileno())
+                os.replace(tmp_file_path, output_file_path)
                 result["output_file_path"] = output_file_path
             except OSError as e:
                 return {

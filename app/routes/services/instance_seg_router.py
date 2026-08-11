@@ -2,7 +2,7 @@ import asyncio
 import json
 import os
 from logging import getLogger
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -84,12 +84,40 @@ class StartTrainingBody(BaseModel):
         description="Optional human-readable name/alias for this training run.",
         pattern=r"^[\w\-\s]{1,80}$",
     )
+    hierarchy_conflict_policy: Literal["strict", "normalize"] = Field(
+        default="strict",
+        description=(
+            "Reject hierarchy geometry conflicts, or normalize eligible masks in "
+            "the training export after explicit user confirmation."
+        ),
+    )
 
 
 @router.get("/models")
-async def get_models(user: User = Depends(get_current_user)):
-    """Retrieve available instance segmentation models directly from MLflow."""
-    return await asyncio.to_thread(list_available_models, "instance-segmentation")
+async def get_models(
+    dataset_id: int,
+    user: User = Depends(get_current_user),
+):
+    """Retrieve inference-ready trained instance segmentation models for a dataset."""
+    ensure_permission(user, dataset_id, Permission.DATASET_READ)
+    return await asyncio.to_thread(
+        list_available_models,
+        "instance-segmentation",
+        model_role="trained",
+        dataset_id=dataset_id,
+    )
+
+
+
+@router.get("/training/models")
+async def get_training_base_models(user: User = Depends(get_current_user)):
+    """Retrieve trainable base models for fine-tuning."""
+    return await asyncio.to_thread(
+        list_available_models,
+        "instance-segmentation",
+        model_role="training_base",
+    )
+
 
 
 @router.get("/training/label-annotation-counts")
@@ -178,7 +206,7 @@ async def start_training(
     # thread's session doesn't deadlock against it (critical for SQLite tests).
     db.commit()
 
-    def _export_job(engine, dataset_id, label_ids):
+    def _export_job(engine, dataset_id, label_ids, hierarchy_conflict_policy):
         from sqlalchemy.orm import Session
         with Session(engine) as thread_db:
             return export_training_hierarchy_dataset(
@@ -186,6 +214,7 @@ async def start_training(
                 db=thread_db,
                 selected_label_ids=label_ids,
                 write_to_disk=True,
+                hierarchy_conflict_policy=hierarchy_conflict_policy,
             )
 
     export = await run_in_threadpool(
@@ -193,13 +222,19 @@ async def start_training(
         engine=db.get_bind(),
         dataset_id=body.dataset_id,
         label_ids=[l.id for l in labels],
+        hierarchy_conflict_policy=body.hierarchy_conflict_policy,
     )
     if not export.get("success"):
+        error_code = export.get("error_code", "export_failed")
         raise HTTPException(
-            status_code=http_status.HTTP_400_BAD_REQUEST,
+            status_code=(
+                http_status.HTTP_409_CONFLICT
+                if error_code == "hierarchy_normalization_required"
+                else http_status.HTTP_400_BAD_REQUEST
+            ),
             detail={
                 "message": export.get("message", "Failed to export annotations."),
-                "error_code": export.get("error_code", "export_failed"),
+                "error_code": error_code,
                 "details": export.get("details", {}),
             }
         )
@@ -207,6 +242,8 @@ async def start_training(
         raise HTTPException(status_code=http_status.HTTP_400_BAD_REQUEST,
                             detail="Dataset has no reviewed annotations to train on.")
 
+    selected_label_ids = [l.id for l in labels]
+    enable_hierarchy = any(l.parent_id is not None or bool(l.children) for l in labels)
     request = InstanceSegmentationTrainingRequest(
         dataset_id=body.dataset_id,
         image_folder_path=image_folder_path,
@@ -215,6 +252,8 @@ async def start_training(
         labels=labels,
         annotation_file_url=export["output_file_path"],
         hyper_parameter=dict(body.hyper_parameter),
+        selected_label_ids=selected_label_ids,
+        enable_hierarchy=enable_hierarchy,
     )
 
     try:
@@ -228,7 +267,10 @@ async def start_training(
         raise HTTPException(status_code=http_status.HTTP_502_BAD_GATEWAY,
                             detail=f"Could not start training: {exc}")
 
-    return {"success": True, "message": "Training started.", "task_id": result.get("task_id")}
+    response = {"success": True, "message": "Training started.", "task_id": result.get("task_id")}
+    if body.hierarchy_conflict_policy == "normalize":
+        response["normalization_summary"] = export.get("normalization_summary", {})
+    return response
 
 
 def _parse_label_ids(raw) -> list[int]:
@@ -297,6 +339,7 @@ def _enrich_job_with_mlflow(job: dict) -> dict:
     error_dict = job.get("error") or {}
     return {
         "task_id": job.get("task_id"),
+        "dataset_id": job.get("dataset_id"),
         "run_id": run_id,
         "state": state,
         "epoch": epoch,
@@ -305,14 +348,16 @@ def _enrich_job_with_mlflow(job: dict) -> dict:
         "label_ids": label_ids,
         "run_name": job.get("run_name"),
         "training_parameters": training_parameters,
-        "start_time": job.get("started_at"),
+        # Queued jobs have not started yet, but the UI still needs a stable
+        # timestamp to show a useful long-wait warning and allow cancellation.
+        "start_time": job.get("started_at") or job.get("queued_at") or job.get("created_at"),
         "end_time": job.get("finished_at"),
         "error_code": error_dict.get("code"),
         "error_message": error_dict.get("message"),
     }
 
 
-async def _read_training_snapshot(task_id: str) -> dict:
+async def _read_training_snapshot(task_id: str, user: User | None = None, required_permission: Permission = Permission.AI_TRAIN) -> dict:
     """Read a progress snapshot for a Celery ``task_id`` from the durable AI store."""
     try:
         job = await service.get_training_task_state(task_id)
@@ -320,40 +365,66 @@ async def _read_training_snapshot(task_id: str) -> dict:
         if getattr(getattr(e, "response", None), "status_code", None) == 404:
             raise HTTPException(status_code=404, detail="Training job not found")
         raise HTTPException(status_code=502, detail="Durable AI service outage")
-        
+
+    dataset_id = job.get("dataset_id")
+    if not dataset_id:
+        raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail="Training job missing dataset metadata")
+
+    if user:
+        ensure_permission(user, int(dataset_id), required_permission)
+
     return await asyncio.to_thread(_enrich_job_with_mlflow, job)
 
 
-async def _read_run_snapshot(run_id: str) -> dict:
+async def _read_run_snapshot(run_id: str, user: User | None = None, required_permission: Permission = Permission.AI_TRAIN) -> dict:
     """Read a progress snapshot for a specific MLflow ``run_id`` (e.g., past run)."""
     client = MODEL_REGISTRY.client
-    run = await asyncio.to_thread(client.get_run, run_id)
+    try:
+        run = await asyncio.to_thread(client.get_run, run_id)
+    except Exception:
+        raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail="MLflow run not found")
+
     task_id = run.data.tags.get("celery_task_id")
-    
+
     job = None
     if task_id:
         try:
             job = await service.get_training_task_state(task_id)
         except Exception:
             pass
-            
+
+    raw_ds_id = job.get("dataset_id") if job else run.data.tags.get("dataset_id")
+    if not raw_ds_id:
+        raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail="Run missing dataset metadata")
+
+    if user:
+        ensure_permission(user, int(raw_ds_id), required_permission)
+
     if not job:
-        # Fallback for old runs that don't exist in the new durable store
         job = {
             "task_id": task_id,
+            "dataset_id": int(raw_ds_id),
             "mlflow_run_id": run_id,
             "state": _STATE_BY_MLFLOW_STATUS.get(run.info.status, "PROGRESS"),
             "epoch": run.data.metrics.get("epoch", 0),
             "total_epochs": run.data.params.get("epochs"),
             "run_name": run.data.tags.get("run_name"),
         }
-        
+
     return await asyncio.to_thread(_enrich_job_with_mlflow, job)
 
 
 async def _list_training_runs(dataset_id: int) -> list[dict]:
     """Return snapshots for all durable training jobs associated with a dataset."""
-    jobs = await service.list_training_jobs(dataset_id, limit=100)
+    try:
+        jobs = await service.list_training_jobs(dataset_id, limit=100)
+    except Exception as exc:
+        if getattr(getattr(exc, "response", None), "status_code", None) == 404:
+            return []
+        raise HTTPException(
+            status_code=http_status.HTTP_502_BAD_GATEWAY,
+            detail="Durable AI service outage",
+        ) from exc
 
     async def snapshot(job):
         return await asyncio.to_thread(_enrich_job_with_mlflow, job)
@@ -371,13 +442,13 @@ async def list_training_runs(dataset_id: int,
 @router.get("/training/runs/{run_id}")
 async def get_run_snapshot(run_id: str, user: User = Depends(get_current_user)):
     """Return a progress snapshot for a specific (e.g. past) MLflow run."""
-    return await _read_run_snapshot(run_id)
+    return await _read_run_snapshot(run_id, user=user, required_permission=Permission.AI_TRAIN)
 
 
 @router.get("/training/{task_id}")
 async def get_training_status(task_id: str, user: User = Depends(get_current_user)):
     """Return a single durable progress snapshot for a training job."""
-    return await _read_training_snapshot(task_id)
+    return await _read_training_snapshot(task_id, user=user, required_permission=Permission.AI_TRAIN)
 
 
 @router.get("/training/{task_id}/stream")
@@ -393,7 +464,7 @@ async def get_training_status_stream(task_id: str, request: Request,
         while True:
             if await request.is_disconnected():
                 return
-            snapshot = await _read_training_snapshot(task_id)
+            snapshot = await _read_training_snapshot(task_id, user=user, required_permission=Permission.AI_TRAIN)
             yield f"data: {json.dumps(snapshot)}\n\n"
             if snapshot["state"] in _TERMINAL_STATES:
                 return
@@ -410,8 +481,11 @@ async def get_training_status_stream(task_id: str, request: Request,
 async def cancel_training_of_model(task_id: str, user: User = Depends(get_current_user)):
     """Cancel a task cooperatively through the durable store."""
     try:
+        await _read_training_snapshot(task_id, user=user, required_permission=Permission.AI_TRAIN)
         await service.cancel_training(task_id)
-        return await _read_training_snapshot(task_id)
+        return await _read_training_snapshot(task_id, user=user, required_permission=Permission.AI_TRAIN)
+    except HTTPException:
+        raise
     except Exception as exc:
         logger.exception("Failed to cancel instance segmentation training.")
         raise HTTPException(status_code=http_status.HTTP_502_BAD_GATEWAY,

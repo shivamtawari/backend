@@ -39,60 +39,51 @@ def _registry_key(model) -> str:
     return getattr(model, "registry_key", None) or model.name
 
 
-def _models_for_task(task: str):
-    """Registered, ready-to-serve models advertising ``task``.
+def _models_for_task(task: str, model_role: str | None = None, dataset_id: int | None = None):
+    """Registered, ready-to-serve models advertising ``task`` (optionally filtered by role and dataset_id)."""
+    task_clean = task.strip().lower()
+    task_boolean_tag = "task_" + task_clean.replace("-", "_")
+    task_underscore = task_clean.replace("-", "_")
+    task_hyphen = task_clean.replace("_", "-")
 
-    The unified ai-service stamps a filter-safe per-task boolean tag
-    (``task_<name>`` == "true") for every task a model serves, so a multi-task
-    model (e.g. SAM 3, which does both instance suggestion and prompted
-    segmentation) is found under each of its tasks -- not only its primary
-    ``task`` tag. We union that with a search on the legacy single ``task`` tag
-    so models registered before the merge still appear during the transition.
-    """
-    task_tag = "task_" + task.replace("-", "_")
     by_name: dict[str, object] = {}
-    for tags in ({task_tag: "true", "status": "ready"},
-                 {"task": task, "status": "ready"}):
+    for base_tags in (
+        {task_boolean_tag: "true", "status": "ready"},
+        {"task": task_hyphen, "status": "ready"},
+        {"task": task_underscore, "status": "ready"},
+    ):
+        tags = dict(base_tags)
+        if model_role:
+            tags["model_role"] = model_role
+        if dataset_id is not None:
+            tags["dataset_id"] = str(dataset_id)
         for model in _search_registered_models_by_tags(tags):
             by_name[model.name] = model
     return list(by_name.values())
 
 
-def _full_model_info(registry_key: str) -> dict:
-    """Return a model's complete ``model_info`` from its artifact metadata.
 
-    ``register_model`` stores the full ``ModelInfo.model_dump()`` as the logged
-    model's ``metadata`` (recorded in the MLmodel file, not the weights), so
-    reading it back is lossless and cheap -- ~50ms regardless of model size, and
-    independent of toolbox version. This is preferable to rebuilding the info
-    from the registered-model tags, which only carry the filterable subset
-    (task/status/...) and drop free-text fields like description and usage_tip.
-
-    Falls back to a minimal stub if an older artifact carries no metadata.
-    """
-    try:
-        info = mlflow.models.get_model_info(f"models:/{registry_key}@latest")
-        if info.metadata:
-            return info.metadata
-        logger.warning("Model '%s' has no artifact metadata; returning stub.", registry_key)
-    except Exception:
-        logger.exception("Failed to read artifact metadata for model '%s'.", registry_key)
+def _full_model_info(registry_key: str, default_alias: str = "active") -> dict:
+    """Return a model's complete ``model_info`` from its artifact metadata."""
+    for target in (f"models:/{registry_key}@{default_alias}", f"models:/{registry_key}@latest"):
+        try:
+            info = mlflow.models.get_model_info(target)
+            if info.metadata:
+                return info.metadata
+        except Exception:
+            continue
+    logger.warning("Model '%s' has no artifact metadata; returning stub.", registry_key)
     return {"registry_key": registry_key, "name": registry_key}
 
 
-def list_available_models(task: str) -> dict:
-    """Return ready-to-serve models for ``task`` directly from MLflow.
-
-    Each result is the model's full ``model_info`` (description, usage_tip,
-    badges, status, trainable, and task-specific fields), read from the artifact
-    metadata. Tags are used only to filter the candidate set.
-
-    Args:
-        task: The model ``task`` tag, e.g. ``"prompted-segmentation"``,
-            ``"instance-suggestion"`` or ``"instance-segmentation"``.
-    """
+def list_available_models(
+    task: str,
+    model_role: str | None = None,
+    dataset_id: int | None = None,
+) -> dict:
+    """Return ready-to-serve models for ``task`` directly from MLflow."""
     mlflow.set_tracking_uri(MLFLOW_URL)
-    matched = _models_for_task(task)
+    matched = _models_for_task(task, model_role=model_role, dataset_id=dataset_id)
     models = [_full_model_info(_registry_key(m)) for m in matched]
     return {
         "success": True,

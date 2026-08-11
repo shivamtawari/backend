@@ -82,7 +82,7 @@ def _add_contour(db, contour_id, label_id, parent_id=None, mask_id=1, x=None, y=
     db.commit()
     return c
 
-def _pred(label_id, id=None, parent_id=None, x=None, y=None):
+def _pred(label_id, id=None, parent_id=None, children=None, x=None, y=None):
     if x is None: x = [0.1, 0.2, 0.2]
     if y is None: y = [0.1, 0.1, 0.2]
     return Contour(
@@ -91,6 +91,7 @@ def _pred(label_id, id=None, parent_id=None, x=None, y=None):
         confidence=0.9,
         x=x, y=y,
         parent_id=parent_id,
+        children=children or [],
         quantification=QuantificationModel()
     )
 
@@ -112,6 +113,31 @@ async def test_patch_suppresses_duplicates(db):
     assert stats["suppressed_count"] == 1
     assert stats["added_count"] == 1
     assert db.query(Contours).count() == 2
+
+
+@pytest.mark.anyio
+async def test_patch_keeps_novel_children_of_a_suppressed_duplicate_parent(db):
+    existing_parent = _add_contour(
+        db, 101, 10, x=[0.1, 0.4, 0.4], y=[0.1, 0.1, 0.4]
+    )
+    novel_child = _pred(
+        20, x=[0.2, 0.25, 0.25], y=[0.2, 0.2, 0.25]
+    )
+    duplicate_parent = _pred(
+        10,
+        children=[novel_child],
+        x=[0.1, 0.4, 0.4],
+        y=[0.1, 0.1, 0.4],
+    )
+
+    stats = await apply_instance_segmentation_predictions(
+        db, 1, 1, "test_user", [duplicate_parent], "patch", _model([10, 20])
+    )
+
+    assert stats["suppressed_count"] == 1
+    assert stats["added_count"] == 1
+    child = db.query(Contours).filter_by(label_id=20).one()
+    assert child.parent_id == existing_parent.id
 
 @pytest.mark.anyio
 async def test_replace_deletes_scope_and_preserves_others(db):

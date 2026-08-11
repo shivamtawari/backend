@@ -35,8 +35,7 @@ dependencies = [
 ]
 
 [tool.uv.sources]
-# When making local changes across services, switch this to a local editable path:
-iquana-toolbox = { path = "../iquana-toolbox", editable = true }
+iquana-toolbox = { git = "https://github.com/shivamtawari/iquana-toolbox.git", rev = "c2be767bd475d56ff8af7de6cfabe9c202ae3a6f" }
 # iquana-toolbox pulls in torch transitively. This backend never runs model
 # inference itself (that's the separate ai-service, over AI_SERVICE_URL) and
 # no code here imports torch directly, so the CUDA build is pure dead weight:

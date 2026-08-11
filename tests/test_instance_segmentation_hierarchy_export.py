@@ -1,6 +1,7 @@
 """Focused tests for the pure ``exclusive_hierarchy_v1`` encoder."""
 
 import json
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -8,10 +9,26 @@ import pytest
 from app.services.instance_segmentation_training import (
     EXCLUSIVE_HIERARCHY_V1,
     HierarchyValidationError,
+    _prepare_training_image_nodes,
+    _rasterize_training_contour,
     decode_coco_rle,
     encode_exclusive_hierarchy_v1,
     reconstruct_hierarchy_masks,
 )
+
+
+def test_training_rasterization_clips_crop_boundary_overshoot():
+    contour = SimpleNamespace(
+        id=99,
+        x=[-0.1, 0.5, 1.1, 0.5],
+        y=[0.5, -0.1, 0.5, 1.1],
+    )
+
+    mask, clipped = _rasterize_training_contour(contour, width=20, height=10)
+
+    assert clipped is True
+    assert mask.shape == (10, 20)
+    assert mask.any()
 
 
 def _rect(height, width, top, left, bottom, right):
@@ -34,6 +51,113 @@ def _node(contour_id, label_id, mask, parent_id=None, image_id=1):
 
 def _annotations_by_id(payload):
     return {annotation["id"]: annotation for annotation in payload["annotations"]}
+
+
+def _prepared_by_id(nodes):
+    return {node.id: node for node in nodes}
+
+
+def test_training_normalization_expands_parent_and_splits_siblings_by_centroid():
+    parent = _rect(10, 10, 1, 1, 9, 9)
+    first = _rect(10, 10, 0, 2, 5, 6)
+    second = _rect(10, 10, 0, 4, 5, 8)
+
+    prepared, issue = _prepare_training_image_nodes(
+        raw_nodes=[
+            _node(1, 10, parent, image_id=7),
+            _node(2, 20, first, parent_id=1, image_id=7),
+            _node(3, 20, second, parent_id=1, image_id=7),
+        ],
+        width=10,
+        height=10,
+        image_id=7,
+        file_name="image.png",
+        selected_label_ids=[10, 20],
+    )
+
+    by_id = _prepared_by_id(prepared)
+    assert issue["action"] == "normalize"
+    assert issue["adjustable_child_count"] == 2
+    assert issue["sibling_overlap_pair_count"] == 1
+    assert not np.logical_and(by_id[2].mask, by_id[3].mask).any()
+    assert np.logical_and(by_id[2].mask, ~by_id[1].mask).sum() == 0
+    assert np.logical_and(by_id[3].mask, ~by_id[1].mask).sum() == 0
+    assert by_id[2].mask.any() and by_id[3].mask.any()
+
+
+def test_training_normalization_uses_original_50_percent_threshold():
+    parent = _rect(8, 8, 2, 2, 6, 6)
+    exactly_half = _rect(8, 8, 1, 2, 3, 6)
+    below_half = _rect(8, 8, 0, 2, 3, 6)
+
+    _, eligible = _prepare_training_image_nodes(
+        raw_nodes=[
+            _node(1, 10, parent),
+            _node(2, 20, exactly_half, parent_id=1),
+        ],
+        width=8,
+        height=8,
+        image_id=1,
+        file_name="eligible.png",
+        selected_label_ids=[10, 20],
+    )
+    _, excluded = _prepare_training_image_nodes(
+        raw_nodes=[
+            _node(1, 10, parent),
+            _node(2, 20, below_half, parent_id=1),
+        ],
+        width=8,
+        height=8,
+        image_id=1,
+        file_name="excluded.png",
+        selected_label_ids=[10, 20],
+    )
+
+    assert eligible["action"] == "normalize"
+    assert eligible["adjustable_children"][0]["contained_fraction"] == 0.5
+    assert excluded["action"] == "exclude"
+    assert excluded["unsafe_children"][0]["contained_fraction"] < 0.5
+
+
+def test_identical_siblings_exclude_image_instead_of_dropping_an_instance():
+    parent = _rect(8, 8, 1, 1, 7, 7)
+    child = _rect(8, 8, 2, 2, 6, 6)
+
+    _, issue = _prepare_training_image_nodes(
+        raw_nodes=[
+            _node(1, 10, parent),
+            _node(2, 20, child, parent_id=1),
+            _node(3, 20, child, parent_id=1),
+        ],
+        width=8,
+        height=8,
+        image_id=1,
+        file_name="identical.png",
+        selected_label_ids=[10, 20],
+    )
+
+    assert issue["action"] == "exclude"
+    assert issue["empty_after_normalization"] == [3]
+
+
+def test_unselected_child_does_not_expand_selected_parent():
+    parent = _rect(8, 8, 2, 2, 6, 6)
+    unselected_child = _rect(8, 8, 0, 0, 3, 3)
+
+    prepared, issue = _prepare_training_image_nodes(
+        raw_nodes=[
+            _node(1, 10, parent),
+            _node(2, 20, unselected_child, parent_id=1),
+        ],
+        width=8,
+        height=8,
+        image_id=1,
+        file_name="selected-parent.png",
+        selected_label_ids=[10],
+    )
+
+    assert issue["requires_normalization"] is False
+    assert np.array_equal(_prepared_by_id(prepared)[1].mask, parent)
 
 
 def test_two_level_masks_are_rle_disjoint_and_round_trip():
@@ -1005,4 +1129,4 @@ def test_export_training_hierarchy_dataset_comprehensive(db_ctx):
         selected_label_ids=[empty_label.id]
     )
     assert result_no_contours["success"] is False
-    assert result_no_contours["error_code"] == "empty_export"
+    assert result_no_contours["error_code"] == "missing_label_annotations"
