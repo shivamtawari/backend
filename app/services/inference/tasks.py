@@ -33,7 +33,7 @@ from app.database import get_context_session
 from app.database.images import Images
 from app.database.inference_jobs import InferenceJobItems, InferenceJobs
 from app.schemas.inference import InferenceOptions, ResolvedStep, WriteMode
-from app.services.celery_app import celery_app
+from app.services.celery_app import BACKEND_QUEUE, celery_app
 from app.services.inference.execution import InferenceUnitError, run_unit, wipe_images
 
 logger = getLogger(__name__)
@@ -109,7 +109,7 @@ def run_job(self, job_id: int) -> dict:
                 finish(db, job, "failed", f"Could not clear existing annotations: {exc}")
                 return {"status": "failed"}
 
-    first = run_next.apply_async((job_id,))
+    first = run_next.apply_async((job_id,), queue=BACKEND_QUEUE)
     with get_context_session() as db:
         job = db.get(InferenceJobs, job_id)
         if job is not None:
@@ -145,7 +145,7 @@ def run_next(self, job_id: int) -> dict:
         _run_one(db, job, item, steps[item.step_index], options)
 
     # Queued outside the session so the row lock is gone before the next task can pick it up.
-    followup = run_next.apply_async((job_id,))
+    followup = run_next.apply_async((job_id,), queue=BACKEND_QUEUE)
     with get_context_session() as db:
         job = db.get(InferenceJobs, job_id)
         if job is not None and job.status == "running":

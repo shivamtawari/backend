@@ -31,7 +31,7 @@ from app.schemas.inference import (
 )
 from app.schemas.permissions import Permission
 from app.services.auth import get_current_user
-from app.services.celery_app import celery_app
+from app.services.celery_app import BACKEND_QUEUE, celery_app
 from app.services.inference import planning, progress, tasks
 from app.services.permissions import ensure_permission, require
 
@@ -117,7 +117,7 @@ async def create_job(
     from app.services.inference.tasks import run_job
 
     try:
-        task = run_job.apply_async((job.id,))
+        task = run_job.apply_async((job.id,), queue=BACKEND_QUEUE)
     except Exception as exc:
         logger.exception("Could not enqueue inference job %s.", job.id)
         job.status = "failed"
