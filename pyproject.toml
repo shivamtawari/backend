@@ -35,7 +35,9 @@ dependencies = [
 ]
 
 [tool.uv.sources]
-iquana-toolbox = { path = "../iquana-toolbox-issue-27", editable = true }
+# Reachable Issue #27 input-contract revision on the personal toolbox fork. The local
+# sibling checkout is intentionally not part of this repository's dependency graph.
+iquana-toolbox = { git = "https://github.com/shivamtawari/iquana-toolbox.git", rev = "a8ac569875fc52d6859e2680e63ab0f739795c1c" }
 # iquana-toolbox pulls in torch transitively. This backend never runs model
 # inference itself (that's the separate ai-service, over AI_SERVICE_URL) and
 # no code here imports torch directly, so the CUDA build is pure dead weight:
